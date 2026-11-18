@@ -1,0 +1,560 @@
+---
+title: "Can past prices forecast the price of Wrapped Bitcoin? ARIMA and GARCH models at daily, weekly and monthly frequency"
+author: "Delphine HOUNYE, African School of Economics"
+date: "February 2024 (updated November 2026)"
+output:
+  pdf_document:
+    number_sections: true
+    toc: false
+  github_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    html_preview: false
+fontsize: 11pt
+geometry: margin=2.5cm
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{graphicx}
+---
+
+```{r setup, include=FALSE}
+# The code is hidden in the report. All the code is in this file.
+# out.width = "100%" keeps every figure inside the margins of the page
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4, fig.align = "center",
+                      out.width = "100%")
+
+library(xts)       # time series objects, weekly and monthly series
+library(forecast)  # ARIMA models
+library(tseries)   # stationarity and normality tests
+library(fGarch)    # GARCH model
+```
+
+```{r functions}
+# Print a table with its caption: a LaTeX table in the PDF, a Markdown table on GitHub.
+# In the PDF, the caption and the table are kept on the same page.
+show_table <- function(x, digits, number, caption) {
+  if (knitr::is_latex_output()) {
+    latex_table <- knitr::kable(x, format = "latex", booktabs = TRUE, digits = digits, linesep = "")
+    knitr::asis_output(paste0("\\noindent\\begin{minipage}{\\textwidth}\n",
+                              "\\textbf{Table ", number, ".} ", caption, "\n",
+                              "\\begin{center}\n\\vspace{2pt}\n\\small\n",
+                              # the table is reduced only if it is wider than the text
+                              "\\resizebox{\\ifdim\\width>\\linewidth\\linewidth\\else\\width\\fi}{!}{",
+                              latex_table, "}\n\\end{center}\n",
+                              "\\end{minipage}\n\n\\vspace{6pt}\n\n"))
+  } else {
+    markdown_table <- paste(knitr::kable(x, digits = digits), collapse = "\n")
+    knitr::asis_output(paste0("**Table ", number, ".** ", caption, "\n\n", markdown_table, "\n"))
+  }
+}
+
+# Skewness and kurtosis of a series
+skewness <- function(x) mean((x - mean(x))^3) / sd(x)^3
+kurtosis <- function(x) mean((x - mean(x))^4) / sd(x)^4
+
+# Descriptive statistics of a series of returns
+describe_returns <- function(x) {
+  data.frame(observations = length(x), mean = mean(x), sd = sd(x),
+             min = min(x), max = max(x),
+             skewness = skewness(x), kurtosis = kurtosis(x),
+             p_value_mean_zero = t.test(x)$p.value)
+}
+
+# ADF and KPSS tests for a log price and for its returns
+stationarity_tests <- function(log_price) {
+  returns <- diff(log_price)
+  adf_price <- adf.test(log_price)
+  kpss_price <- kpss.test(log_price, null = "Trend")
+  adf_returns <- adf.test(returns)
+  kpss_returns <- kpss.test(returns, null = "Level")
+  data.frame(
+    series = c("log price", "log returns"),
+    ADF_statistic = as.numeric(c(adf_price$statistic, adf_returns$statistic)),
+    ADF_p_value = c(adf_price$p.value, adf_returns$p.value),
+    KPSS_statistic = as.numeric(c(kpss_price$statistic, kpss_returns$statistic)),
+    KPSS_p_value = c(kpss_price$p.value, kpss_returns$p.value)
+  )
+}
+
+# Estimate all the ARIMA(p,1,q) models for p and q from 0 to max_order
+# and return their AIC and BIC
+compare_models <- function(log_price, max_order = 3) {
+  results <- expand.grid(p = 0:max_order, q = 0:max_order)
+  results$AIC <- NA
+  results$BIC <- NA
+  for (i in seq_len(nrow(results))) {
+    fit <- tryCatch(Arima(log_price, order = c(results$p[i], 1, results$q[i]), method = "ML"),
+                    error = function(e) NULL)
+    if (!is.null(fit)) {
+      results$AIC[i] <- AIC(fit)
+      results$BIC[i] <- BIC(fit)
+    }
+  }
+  results$model <- paste0("ARIMA(", results$p, ",1,", results$q, ")")
+  results
+}
+
+# p-values of the tests on the residuals of a model
+residual_tests <- function(model) {
+  residuals_model <- as.numeric(residuals(model))
+  n_coefficients <- length(coef(model))
+  c(Box.test(residuals_model, lag = 10, type = "Ljung-Box", fitdf = n_coefficients)$p.value,
+    Box.test(residuals_model, lag = 20, type = "Ljung-Box", fitdf = n_coefficients)$p.value,
+    jarque.bera.test(residuals_model)$p.value,
+    Box.test(residuals_model^2, lag = 10, type = "Ljung-Box")$p.value)
+}
+```
+
+```{r data}
+# Daily data
+wbtc <- read.csv("wbtc_usd_daily.csv")
+colnames(wbtc) <- c("date", "open", "high", "low", "close", "volume", "adjusted")
+wbtc$date <- as.Date(wbtc$date)
+
+close_daily <- xts(wbtc$close, order.by = wbtc$date)
+log_price_daily <- log(wbtc$close)
+return_daily <- diff(log_price_daily)
+
+# Weekly and monthly data: closing price of the last day of each week and of each month
+close_weekly <- apply.weekly(close_daily, last)
+dates_weekly <- index(close_weekly)
+log_price_weekly <- log(as.numeric(close_weekly))
+return_weekly <- diff(log_price_weekly)
+
+close_monthly <- apply.monthly(close_daily, last)
+dates_monthly <- index(close_monthly)
+log_price_monthly <- log(as.numeric(close_monthly))
+return_monthly <- diff(log_price_monthly)
+```
+
+# Abstract {-}
+
+This project studies whether the past prices of Wrapped Bitcoin (WBTC) help to forecast its future prices. I use five years of daily prices, from 31 January 2019 to 31 January 2024, and I model the closing price at the daily, weekly and monthly frequencies with ARIMA models. At the three frequencies, the log price is not stationary, its returns are stationary and I find no seasonal pattern. The selected models are ARIMA(1,1,0) for the daily price and the random walk for the weekly and monthly prices. The daily returns have very frequent extreme values and a variance that changes over time, which a GARCH(1,1) model captures. These features fade at lower frequencies. On three months of data not used for the estimation, the daily model does not forecast significantly better than the random walk.
+
+# Introduction
+
+Cryptocurrencies are traded every day and their prices move a lot. A natural question is whether their past prices help to forecast their future prices. If prices already reflect the available information, as in the efficient market hypothesis (Fama, 1970), the price should behave like a random walk and its past should be of little use to forecast its future.
+
+This project studies this question for Wrapped Bitcoin (WBTC), a token that is backed one-to-one by Bitcoin, so that its price follows the price of Bitcoin. I use the daily prices of WBTC in US dollars from 31 January 2019 to 31 January 2024. The project answers three questions:
+
+1. Which ARIMA model describes the closing price at the daily, weekly and monthly frequencies?
+2. How do the properties of the returns change with the frequency?
+3. Does the selected daily model forecast better than a random walk on data that were not used to estimate it?
+
+The main results are the following. At the three frequencies, the log price has a unit root and the selected model is a random walk or very close to it: ARIMA(1,1,0) with a small negative coefficient for the daily price, and ARIMA(0,1,0) for the weekly and monthly prices. The daily returns have heavy tails and a changing variance. These features are weaker in the weekly returns and are not detected in the monthly returns. Out of sample, the daily model is not significantly better than the random walk.
+
+This report is the final project of the Quantitative Finance course of the Master in Mathematics, Economics and Statistics (MMES) at the African School of Economics. The assignment asked to download five years of daily prices for one asset, to plot the series, to specify an ARIMA model for the daily, weekly and monthly closing prices, and to comment on the differences between the three models. I submitted the project in February 2024 and reworked it in November 2026: I corrected the way the series are differenced, the choice of the models and the reading of the residual tests, and I added the volatility model and the forecast evaluation, which were not in the assignment.
+
+The report is organised as follows. Section 2 presents the related literature. Section 3 describes the data. Section 4 presents the methods. Section 5 gives the results. Section 6 discusses the limitations and Section 7 concludes.
+
+# Related literature
+
+The starting point is the efficient market hypothesis. In its weak form, prices reflect all the information contained in past prices, so that returns cannot be forecast from their own past (Fama, 1970). A random walk for the log price is the simplest model consistent with this idea.
+
+Empirical work on asset returns has documented properties that are common to many markets. Cont (2001) presents them as a set of stylized facts. Four of them matter here: returns have little linear autocorrelation; their distribution has heavy tails; large movements come in clusters (volatility clustering); and the distribution of returns gets closer to a normal distribution when the returns are computed over longer periods (aggregational Gaussianity).
+
+Volatility clustering is usually modelled with the ARCH model of Engle (1982) and its generalisation, the GARCH model of Bollerslev (1986), in which the variance of today depends on past shocks and on past variances.
+
+Several studies apply these tools to Bitcoin. Urquhart (2016) tests the efficiency of the Bitcoin market and finds that returns are inefficient over his full sample, but that the market may be moving towards efficiency in the later part of the sample. Nadarajah and Chu (2017) show that a power transformation of Bitcoin returns satisfies the efficient market hypothesis. Katsiampa (2017) compares several GARCH models on Bitcoin prices and finds that a model with a short-run and a long-run component of the variance fits best.
+
+This project is much simpler than these studies: it uses one asset and standard models. It checks whether the same properties appear for WBTC between 2019 and 2024, and how they change between the daily, weekly and monthly frequencies.
+
+# Data
+
+The data are the daily prices of WBTC in US dollars (ticker `WBTC-USD`), downloaded from Yahoo Finance with the R package `quantmod`. They are saved in the file `wbtc_usd_daily.csv` so that the results can be reproduced without a new download.
+
+```{r}
+n_days <- nrow(wbtc)
+```
+
+The sample has `r n_days` daily observations, from 31 January 2019 to 31 January 2024. There is no missing value and no missing day, because WBTC is traded every day of the week. I use the closing price.
+
+For the weekly and monthly series, I keep the closing price of the last day of each week and of each month, which gives `r length(log_price_weekly)` weekly and `r length(log_price_monthly)` monthly observations. I do not use the average price of the period, because averaging prices creates an artificial autocorrelation in the returns (Working, 1960).
+
+Figure 1 shows the daily closing price and the daily log returns. The price goes from about 3,500 USD at the end of January 2019 to about 42,500 USD at the end of January 2024. The lowest closing price is 3,396 USD (7 February 2019) and the highest is 67,549 USD (8 November 2021). The lowest daily return is on 12 March 2020, the day of the market crash at the start of the Covid-19 pandemic, when the price lost 38% in one day.
+
+```{r figure1, fig.height=3.6}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(wbtc$date, wbtc$close, type = "l",
+     main = "Daily closing price", xlab = "Date", ylab = "Price (USD)")
+plot(wbtc$date[-1], return_daily, type = "l",
+     main = "Daily log returns", xlab = "Date", ylab = "Log return")
+```
+
+**Figure 1.** Daily closing price of WBTC and daily log returns, 31 January 2019 to 31 January 2024.
+
+# Methodology
+
+## Returns and stationarity
+
+Let $P_t$ be the closing price at date $t$. I work with the log price $\ln P_t$ and with the log return
+
+$$r_t = \ln P_t - \ln P_{t-1},$$
+
+which is close to the percentage change of the price.
+
+An ARIMA model requires a stationary series. I test the stationarity of the log price and of the returns with two tests that have opposite null hypotheses. The null hypothesis of the Augmented Dickey-Fuller (ADF) test (Dickey and Fuller, 1979) is that the series has a unit root, so it is not stationary. The null hypothesis of the KPSS test (Kwiatkowski et al., 1992) is that the series is stationary. A series is considered stationary when the ADF test rejects its null hypothesis and the KPSS test does not reject its own.
+
+I also check whether there is a seasonal pattern before using a seasonal model. I regress the daily returns on indicators of the day of the week, then of the month of the year, and I test whether the mean return is the same for all days and for all months.
+
+## ARIMA models and their selection
+
+If the log price needs one difference to become stationary, an ARIMA($p$,1,$q$) model for the log price is an ARMA($p$,$q$) model for the returns (Box and Jenkins, 1970):
+
+$$r_t = \phi_1 r_{t-1} + \dots + \phi_p r_{t-p} + \varepsilon_t + \theta_1 \varepsilon_{t-1} + \dots + \theta_q \varepsilon_{t-q},$$
+
+where $\varepsilon_t$ is a white noise. The model with $p = q = 0$ is the random walk: the return is a white noise and the best forecast of the price of tomorrow is the price of today. The models are estimated without a constant, because the mean return is not significantly different from zero at the three frequencies (Table 1).
+
+For each frequency, I look at the autocorrelation function (ACF) and at the partial autocorrelation function (PACF) of the returns, and I estimate by maximum likelihood all the models with $p$ and $q$ between 0 and 3, which gives 16 models. I compare them with two information criteria:
+
+$$AIC = -2 \ln L + 2k, \qquad BIC = -2 \ln L + k \ln n,$$
+
+where $L$ is the likelihood, $k$ the number of estimated parameters and $n$ the number of observations. The best model has the lowest value. The BIC penalises additional parameters more than the AIC. I select the model with the lowest BIC, and I check the choice with the automatic search of the function `auto.arima()` (Hyndman and Khandakar, 2008).
+
+## Residual diagnostics
+
+A model is adequate if its residuals look like a white noise. I check three properties:
+
+- no autocorrelation, with the Ljung-Box test on the residuals (Ljung and Box, 1978), at 10 and 20 lags;
+- normal distribution, with the Jarque-Bera test (Jarque and Bera, 1987);
+- constant variance, with the Ljung-Box test on the squared residuals. Autocorrelation in the squared residuals indicates an ARCH effect.
+
+For each test, the null hypothesis is the property itself, so a p-value above 5% is the good result.
+
+## GARCH model
+
+When the variance of the residuals changes over time, I estimate a GARCH(1,1) model (Bollerslev, 1986) for the daily returns, together with an autoregressive term for the mean:
+
+$$r_t = \mu + \phi_1 r_{t-1} + \varepsilon_t, \qquad \varepsilon_t = \sigma_t z_t,$$
+
+$$\sigma_t^2 = \omega + \alpha \varepsilon_{t-1}^2 + \beta \sigma_{t-1}^2,$$
+
+where $z_t$ is a standard normal white noise. The variance of today, $\sigma_t^2$, depends on the squared shock of yesterday through $\alpha$ and on the variance of yesterday through $\beta$. The sum $\alpha + \beta$ measures how long a shock on the volatility lasts.
+
+## Forecast evaluation
+
+A model can fit the past well and forecast badly. I estimate the daily model without the last three months of the sample (1 November 2023 to 31 January 2024, 92 days), and I compare its forecasts with the real prices of these three months.
+
+Each day of the test period, the model forecasts the price of the next day with the coefficient estimated on the training period. I compare these forecasts with those of the random walk, using the root mean squared error (RMSE) and the mean absolute error (MAE):
+
+$$RMSE = \sqrt{\frac{1}{H} \sum_{t=1}^{H} (P_t - \hat{P}_t)^2}, \qquad MAE = \frac{1}{H} \sum_{t=1}^{H} |P_t - \hat{P}_t|,$$
+
+where $\hat{P}_t$ is the forecast and $H$ the number of days of the test period. The test of Diebold and Mariano (1995) tells whether the difference in accuracy between the two models is statistically significant. I also compute the forecast for the whole test period made on the last day of the training period, with its 95% prediction interval.
+
+# Results
+
+## Descriptive statistics and stationarity
+
+```{r table1}
+table1 <- rbind(describe_returns(return_daily),
+                describe_returns(return_weekly),
+                describe_returns(return_monthly))
+table1 <- cbind(frequency = c("Daily", "Weekly", "Monthly"), table1)
+colnames(table1) <- c("Frequency", "Obs.", "Mean", "Std. dev.", "Min", "Max",
+                      "Skewness", "Kurtosis", "p (mean = 0)")
+```
+
+```{r}
+show_table(table1, digits = c(0, 0, 4, 4, 3, 3, 2, 2, 3), number = 1,
+           caption = "Descriptive statistics of the log returns. The last column is the p-value of the test that the mean return is equal to zero.")
+```
+
+Table 1 describes the returns. The mean daily return is 0.14% and its standard deviation is 3.7%. At the three frequencies, the mean return is not significantly different from zero at the 5% level.
+
+The kurtosis of the daily returns is 22.5, far above the value of 3 of a normal distribution: very large returns are much more frequent than under a normal distribution. The kurtosis falls to 5.3 for the weekly returns and to 2.8 for the monthly returns. Figure 1 also shows that large daily returns come in groups.
+
+```{r table2}
+table2 <- rbind(stationarity_tests(log_price_daily),
+                stationarity_tests(log_price_weekly),
+                stationarity_tests(log_price_monthly))
+table2 <- cbind(frequency = rep(c("Daily", "Weekly", "Monthly"), each = 2), table2)
+colnames(table2) <- c("Frequency", "Series", "ADF statistic", "ADF p-value",
+                      "KPSS statistic", "KPSS p-value")
+```
+
+```{r}
+show_table(table2, digits = 3, number = 2,
+           caption = "Stationarity tests. The p-values are bounded: 0.01 means 0.01 or less, and 0.10 means 0.10 or more.")
+```
+
+Table 2 gives the stationarity tests. For the log price, the ADF test never rejects the unit root (p-values above 0.50) and the KPSS test always rejects stationarity. For the returns, the ADF test rejects the unit root and the KPSS test does not reject stationarity. The evidence is weaker for the monthly returns (ADF p-value of 0.04), which have only 60 observations.
+
+The log price is therefore integrated of order 1 at the three frequencies: one difference is enough.
+
+## Seasonal pattern
+
+```{r seasonality}
+day_of_week <- factor(weekdays(wbtc$date[-1]))
+month_of_year <- factor(months(wbtc$date[-1]))
+p_day <- anova(lm(return_daily ~ day_of_week))$`Pr(>F)`[1]
+p_month <- anova(lm(return_daily ~ month_of_year))$`Pr(>F)`[1]
+```
+
+The mean daily return does not differ significantly between the days of the week (p-value = `r sprintf("%.2f", p_day)`) or between the months of the year (p-value = `r sprintf("%.2f", p_month)`). I do not find a seasonal pattern, so I use ARIMA models without a seasonal part.
+
+## ARIMA models
+
+```{r figure2, fig.height=8}
+par(mfrow = c(3, 2), mar = c(4.5, 4, 3.5, 1))
+Acf(return_daily, lag.max = 30, main = "ACF of the daily returns")
+Pacf(return_daily, lag.max = 30, main = "PACF of the daily returns")
+Acf(return_weekly, lag.max = 30, main = "ACF of the weekly returns")
+Pacf(return_weekly, lag.max = 30, main = "PACF of the weekly returns")
+Acf(return_monthly, lag.max = 20, main = "ACF of the monthly returns")
+Pacf(return_monthly, lag.max = 20, main = "PACF of the monthly returns")
+```
+
+**Figure 2.** Autocorrelation and partial autocorrelation functions of the returns. The dashed lines are the 95% confidence band.
+
+Figure 2 shows the ACF and the PACF of the returns. All the autocorrelations are small. For the daily returns, the first one is negative (about -0.10) and clearly outside the confidence band, and a few others are just outside the band. For the weekly returns, the first one is positive (0.13) and just outside the band. For the monthly returns, none is outside the band. This suggests models with very few terms.
+
+```{r models}
+models_daily <- compare_models(log_price_daily)
+models_weekly <- compare_models(log_price_weekly)
+models_monthly <- compare_models(log_price_monthly)
+
+# The table reports four of the 16 models
+reported <- c("ARIMA(0,1,0)", "ARIMA(1,1,0)", "ARIMA(0,1,1)", "ARIMA(1,1,1)")
+pick <- function(models, criterion) models[match(reported, models$model), criterion]
+table3 <- data.frame(
+  Model = reported,
+  AIC_daily = pick(models_daily, "AIC"), BIC_daily = pick(models_daily, "BIC"),
+  AIC_weekly = pick(models_weekly, "AIC"), BIC_weekly = pick(models_weekly, "BIC"),
+  AIC_monthly = pick(models_monthly, "AIC"), BIC_monthly = pick(models_monthly, "BIC")
+)
+colnames(table3) <- c("Model", "Daily AIC", "Daily BIC", "Weekly AIC", "Weekly BIC",
+                      "Monthly AIC", "Monthly BIC")
+
+# Model with the lowest AIC and with the lowest BIC among the 16, for each frequency
+best <- function(models) c(AIC = models$model[which.min(models$AIC)],
+                           BIC = models$model[which.min(models$BIC)])
+best_models <- rbind(daily = best(models_daily), weekly = best(models_weekly),
+                     monthly = best(models_monthly))
+
+# Automatic search
+auto_daily <- auto.arima(log_price_daily, seasonal = FALSE, ic = "bic",
+                         stepwise = FALSE, approximation = FALSE, max.p = 3, max.q = 3)
+auto_weekly <- auto.arima(log_price_weekly, seasonal = FALSE, ic = "bic",
+                          stepwise = FALSE, approximation = FALSE, max.p = 3, max.q = 3)
+auto_monthly <- auto.arima(log_price_monthly, seasonal = FALSE, ic = "bic",
+                           stepwise = FALSE, approximation = FALSE, max.p = 3, max.q = 3)
+
+# Selected models
+model_daily <- Arima(log_price_daily, order = c(1, 1, 0), method = "ML")
+model_weekly <- Arima(log_price_weekly, order = c(0, 1, 0))
+model_monthly <- Arima(log_price_monthly, order = c(0, 1, 0))
+
+# Alternatives preferred by the AIC for the weekly and monthly data
+alternative_weekly <- Arima(log_price_weekly, order = c(1, 1, 0), method = "ML")
+alternative_monthly <- Arima(log_price_monthly, order = c(0, 1, 1), method = "ML")
+```
+
+```{r}
+show_table(table3, digits = 2, number = 3,
+           caption = "AIC and BIC of four of the 16 estimated models. At each frequency, the model with the lowest AIC and the model with the lowest BIC among the 16 are in this table.")
+```
+
+Table 3 compares the models.
+
+**Daily price.** The BIC selects ARIMA(1,1,0), and `auto.arima()` gives the same model. The AIC is slightly lower for ARIMA(1,1,1), by less than 1. Both are clearly better than the random walk, whose AIC is higher by about 15. I keep ARIMA(1,1,0), the simpler model. Its autoregressive coefficient is `r sprintf("%.3f", coef(model_daily)[1])`, with a standard error of `r sprintf("%.3f", sqrt(diag(vcov(model_daily)))[1])`. It is statistically significant, negative and small: a positive return tends to be followed by a slightly lower return the next day. Apart from this small correction, the log price behaves like a random walk.
+
+**Weekly price.** The two criteria do not agree. The BIC selects the random walk, ARIMA(0,1,0), and `auto.arima()` gives the same model. The AIC is lower for ARIMA(1,1,0), by about 3, and the BIC of the two models is almost the same. In ARIMA(1,1,0), the autoregressive coefficient is `r sprintf("%.2f", coef(alternative_weekly)[1])` with a standard error of `r sprintf("%.2f", sqrt(diag(vcov(alternative_weekly)))[1])`: it is significant at the 5% level, but the evidence is weak. I follow the BIC, as for the daily price, and keep the random walk.
+
+**Monthly price.** The BIC selects the random walk, and `auto.arima()` gives the same model. The AIC is slightly lower for ARIMA(0,1,1), but its moving average coefficient (`r sprintf("%.2f", coef(alternative_monthly)[1])`, standard error of `r sprintf("%.2f", sqrt(diag(vcov(alternative_monthly)))[1])`) is not significant at the 5% level. I keep the random walk.
+
+## Residual diagnostics
+
+```{r table4}
+table4 <- data.frame(
+  Test = c("Ljung-Box, residuals (10 lags)", "Ljung-Box, residuals (20 lags)",
+           "Jarque-Bera", "Ljung-Box, squared residuals (10 lags)"),
+  Null = c("No autocorrelation", "No autocorrelation", "Normality", "Constant variance"),
+  Daily = residual_tests(model_daily),
+  Weekly = residual_tests(model_weekly),
+  Monthly = residual_tests(model_monthly)
+)
+colnames(table4) <- c("Test", "Null hypothesis", "Daily", "Weekly", "Monthly")
+```
+
+```{r}
+show_table(table4, digits = 3, number = 4,
+           caption = "p-values of the tests on the residuals of the selected models: ARIMA(1,1,0) for the daily price, ARIMA(0,1,0) for the weekly and monthly prices.")
+```
+
+```{r figure3, fig.height=3.2}
+par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+qqnorm(as.numeric(residuals(model_daily)), main = "Daily")
+qqline(as.numeric(residuals(model_daily)))
+qqnorm(as.numeric(residuals(model_weekly)), main = "Weekly")
+qqline(as.numeric(residuals(model_weekly)))
+qqnorm(as.numeric(residuals(model_monthly)), main = "Monthly")
+qqline(as.numeric(residuals(model_monthly)))
+```
+
+**Figure 3.** Normal Q-Q plots of the residuals of the selected models.
+
+Table 4 and Figure 3 show how the residuals change with the frequency.
+
+For the daily model, the residuals are not a white noise. The Ljung-Box test rejects the absence of autocorrelation at the 5% level but not at the 1% level. The remaining autocorrelations are small, and none of the 16 models passes this test at the 5% level, so adding terms does not solve it. The Jarque-Bera test rejects normality: in Figure 3, the points are far from the line at both ends. The test on the squared residuals rejects a constant variance. The ARIMA(1,1,0) model describes the mean of the daily returns, but not their variance.
+
+For the weekly model, the tests do not reject the absence of autocorrelation or a constant variance. Normality is still rejected, with fewer extreme values than in the daily data.
+
+For the monthly model, no test rejects its null hypothesis: the residuals are close to a normal white noise. With 61 observations, these tests have less power than with the daily data, so small departures could remain undetected.
+
+These results agree with the stylized facts of Cont (2001): heavy tails and volatility clustering in the daily returns, and a distribution that gets closer to the normal distribution when the frequency decreases.
+
+## Volatility of the daily returns
+
+```{r garch}
+garch_daily <- garchFit(~ arma(1, 0) + garch(1, 1), data = return_daily,
+                        cond.dist = "norm", trace = FALSE)
+garch_coefficients <- garch_daily@fit$matcoef
+volatility_daily <- volatility(garch_daily)
+standardized_residuals <- residuals(garch_daily, standardize = TRUE)
+
+table5 <- data.frame(
+  Parameter = c("mu (mean)", "phi (autoregressive term)", "omega", "alpha", "beta"),
+  Estimate = garch_coefficients[, 1],
+  Std_error = garch_coefficients[, 2],
+  p_value = garch_coefficients[, 4]
+)
+colnames(table5) <- c("Parameter", "Estimate", "Std. error", "p-value")
+rownames(table5) <- NULL
+
+garch_p_values <- c(
+  autocorrelation_10 = Box.test(standardized_residuals, lag = 10, type = "Ljung-Box")$p.value,
+  autocorrelation_20 = Box.test(standardized_residuals, lag = 20, type = "Ljung-Box")$p.value,
+  variance_10 = Box.test(standardized_residuals^2, lag = 10, type = "Ljung-Box")$p.value,
+  normality = jarque.bera.test(standardized_residuals)$p.value
+)
+```
+
+```{r}
+show_table(table5, digits = c(0, 5, 5, 4), number = 5,
+           caption = "Estimates of the AR(1)-GARCH(1,1) model for the daily returns.")
+```
+
+Table 5 gives the estimates of the GARCH model. The coefficients $\alpha$ (`r sprintf("%.2f", garch_coefficients["alpha1", 1])`) and $\beta$ (`r sprintf("%.2f", garch_coefficients["beta1", 1])`) are both significant. Their sum is `r sprintf("%.2f", garch_coefficients["alpha1", 1] + garch_coefficients["beta1", 1])`, close to 1: a shock on the volatility lasts a long time before it disappears. The autoregressive coefficient is still negative and significant.
+
+```{r figure4, fig.height=3.6}
+par(mar = c(4, 4, 1, 1))
+plot(wbtc$date[-1], volatility_daily, type = "l",
+     xlab = "Date", ylab = "Conditional standard deviation")
+```
+
+**Figure 4.** Daily volatility estimated by the GARCH(1,1) model.
+
+Figure 4 shows the estimated daily volatility. It goes from 2.4% in January 2023 to 17% on 13 March 2020, the day after the crash. It is also high in mid-2019, and it is lower in 2023.
+
+With the GARCH model, the standardized residuals have no autocorrelation left (Ljung-Box p-values of `r sprintf("%.2f", garch_p_values["autocorrelation_10"])` at 10 lags and `r sprintf("%.2f", garch_p_values["autocorrelation_20"])` at 20 lags) and no changing variance left (p-value of `r sprintf("%.2f", garch_p_values["variance_10"])` on the squared standardized residuals). The two problems of the daily ARIMA model are solved. The Jarque-Bera test still rejects normality: even after taking the volatility into account, extreme returns such as the crash of March 2020 are more frequent than under a normal distribution.
+
+## Forecast evaluation
+
+```{r forecast}
+test_days <- which(wbtc$date >= as.Date("2023-11-01"))
+train_days <- 1:(min(test_days) - 1)
+
+# The model is estimated on the training period only
+model_train <- Arima(log_price_daily[train_days], order = c(1, 1, 0), method = "ML")
+
+# One-day-ahead forecasts of the ARIMA(1,1,0) model on the test period
+model_applied <- Arima(log_price_daily, model = model_train)
+forecast_arima <- exp(fitted(model_applied)[test_days])
+
+# One-day-ahead forecasts of the random walk: the price of the day before
+forecast_random_walk <- wbtc$close[test_days - 1]
+
+actual <- wbtc$close[test_days]
+
+table6 <- data.frame(
+  Model = c("ARIMA(1,1,0)", "Random walk"),
+  RMSE = c(sqrt(mean((actual - forecast_arima)^2)),
+           sqrt(mean((actual - forecast_random_walk)^2))),
+  MAE = c(mean(abs(actual - forecast_arima)),
+          mean(abs(actual - forecast_random_walk)))
+)
+colnames(table6) <- c("Model", "RMSE (USD)", "MAE (USD)")
+
+# Diebold-Mariano test: do the two models have the same forecast accuracy?
+dm <- dm.test(actual - forecast_arima, actual - forecast_random_walk, h = 1)
+
+# Forecast for the whole test period, made on the last day of the training period
+forecast_test <- forecast(model_train, h = length(test_days), level = 95)
+coverage <- mean(log(actual) >= forecast_test$lower & log(actual) <= forecast_test$upper)
+```
+
+```{r}
+show_table(table6, digits = 1, number = 6,
+           caption = "Accuracy of the one-day-ahead forecasts on the test period (1 November 2023 to 31 January 2024, 92 days).")
+```
+
+Table 6 compares the one-day-ahead forecasts. The RMSE of the ARIMA(1,1,0) model is 1,006 USD, against 1,016 USD for the random walk. The model is slightly better, but the difference is about 1% and the Diebold-Mariano test does not reject equal accuracy (p-value = `r sprintf("%.2f", dm$p.value)`). Over these three months, the ARIMA model does not forecast significantly better than the random walk.
+
+```{r figure5, fig.height=4}
+par(mar = c(4, 4, 1, 1))
+plot_days <- (min(test_days) - 200):nrow(wbtc)
+plot(wbtc$date[plot_days], wbtc$close[plot_days], type = "l",
+     ylim = range(c(wbtc$close[plot_days], exp(forecast_test$lower), exp(forecast_test$upper))),
+     xlab = "Date", ylab = "Price (USD)")
+lines(wbtc$date[test_days], exp(forecast_test$mean), col = "red", lwd = 2)
+lines(wbtc$date[test_days], exp(forecast_test$lower), col = "red", lty = 2)
+lines(wbtc$date[test_days], exp(forecast_test$upper), col = "red", lty = 2)
+legend("topleft", legend = c("Real price", "Forecast", "95% prediction interval"),
+       col = c("black", "red", "red"), lty = c(1, 1, 2), lwd = c(1, 2, 1))
+```
+
+**Figure 5.** Forecast made on 31 October 2023 for the next three months, and real price.
+
+Figure 5 shows the forecast made on 31 October 2023 for the whole test period. The forecast is almost flat at about 34,600 USD, the price of the last day of the training period, because the model is close to a random walk. The real price rose to 42,502 USD at the end of January 2024. All the real prices are inside the 95% prediction interval, but this interval is very wide: after three months, it goes from about 18,000 to 66,000 USD. The model gives the right order of magnitude of the uncertainty, but it cannot say in which direction the price will move.
+
+# Limitations
+
+The analysis covers one asset and five years. This period includes one very large crash, in March 2020, which has a strong influence on the kurtosis and on the tests.
+
+The GARCH model uses normal errors, and the tests reject the normality of its standardized residuals. A distribution with heavier tails for the errors would be the next step.
+
+The forecast evaluation uses one test period of three months. The result could differ in another period.
+
+The monthly series has 61 observations only, so the tests have little power at this frequency. The absence of rejection does not prove that the monthly returns are a normal white noise.
+
+# Conclusion
+
+The log price of WBTC is not stationary and its returns are stationary, at the daily, weekly and monthly frequencies, and I find no seasonal pattern. The selected models are ARIMA(1,1,0) for the daily price and the random walk for the weekly and monthly prices.
+
+The daily returns have a small negative autocorrelation, very frequent extreme values and a variance that changes over time, which a GARCH(1,1) model captures. These features fade when the frequency decreases, and the monthly returns are close to a normal white noise.
+
+Out of sample, the daily model does not forecast significantly better than the random walk. Over this period, the past prices of WBTC give very little information on the direction of its future price, which is consistent with the weak form of the efficient market hypothesis. What can be modelled is the size of the movements of the price, not their direction.
+
+# References {-}
+
+Bollerslev, T. (1986). Generalized autoregressive conditional heteroskedasticity. *Journal of Econometrics*, 31(3), 307-327.
+
+Box, G. E. P. and Jenkins, G. M. (1970). *Time Series Analysis: Forecasting and Control*. San Francisco: Holden-Day.
+
+Cont, R. (2001). Empirical properties of asset returns: stylized facts and statistical issues. *Quantitative Finance*, 1(2), 223-236.
+
+Dickey, D. A. and Fuller, W. A. (1979). Distribution of the estimators for autoregressive time series with a unit root. *Journal of the American Statistical Association*, 74(366), 427-431.
+
+Diebold, F. X. and Mariano, R. S. (1995). Comparing predictive accuracy. *Journal of Business and Economic Statistics*, 13(3), 253-263.
+
+Engle, R. F. (1982). Autoregressive conditional heteroscedasticity with estimates of the variance of United Kingdom inflation. *Econometrica*, 50(4), 987-1007.
+
+Fama, E. F. (1970). Efficient capital markets: a review of theory and empirical work. *The Journal of Finance*, 25(2), 383-417.
+
+Hyndman, R. J. and Khandakar, Y. (2008). Automatic time series forecasting: the forecast package for R. *Journal of Statistical Software*, 27(3), 1-22.
+
+Jarque, C. M. and Bera, A. K. (1987). A test for normality of observations and regression residuals. *International Statistical Review*, 55(2), 163-172.
+
+Katsiampa, P. (2017). Volatility estimation for Bitcoin: a comparison of GARCH models. *Economics Letters*, 158, 3-6.
+
+Kwiatkowski, D., Phillips, P. C. B., Schmidt, P. and Shin, Y. (1992). Testing the null hypothesis of stationarity against the alternative of a unit root. *Journal of Econometrics*, 54(1-3), 159-178.
+
+Ljung, G. M. and Box, G. E. P. (1978). On a measure of lack of fit in time series models. *Biometrika*, 65(2), 297-303.
+
+Nadarajah, S. and Chu, J. (2017). On the inefficiency of Bitcoin. *Economics Letters*, 150, 6-9.
+
+Urquhart, A. (2016). The inefficiency of Bitcoin. *Economics Letters*, 148, 80-82.
+
+Working, H. (1960). Note on the correlation of first differences of averages in a random chain. *Econometrica*, 28(4), 916-918.
